@@ -79,11 +79,24 @@ jobs:
           rm -rf build dist
           mkdir -p build/sketches build/output dist
 
-          esptool_py="$(find "$HOME/.arduino15/packages/esp32/tools/esptool_py" -name esptool.py -print -quit)"
-          if [[ -z "$esptool_py" ]]; then
-            echo "::error::Could not find esptool.py in the installed ESP32 Arduino core."
-            exit 1
-          fi
+          esptool_cmd="$(
+            find "$HOME/.arduino15/packages/esp32/tools/esptool_py" \
+              -type f \( -name esptool -o -name esptool.py \) \
+              -print 2>/dev/null | sort -V | tail -n 1 || true
+          )"
+
+          run_esptool() {
+            if [[ -z "$esptool_cmd" ]]; then
+              echo "::error::Could not find esptool in the installed ESP32 Arduino core."
+              return 1
+            fi
+
+            if [[ "$esptool_cmd" == *.py ]]; then
+              python "$esptool_cmd" "$@"
+            else
+              "$esptool_cmd" "$@"
+            fi
+          }
 
           boot_app0_bin="$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -name boot_app0.bin -print -quit)"
 
@@ -113,45 +126,55 @@ jobs:
             arduino-cli compile \
               --fqbn "$fqbn" \
               --output-dir "$output_dir" \
+              --export-binaries \
               "$sketch_dir"
 
             app_bin="$output_dir/$sketch_file.bin"
             bootloader_bin="$output_dir/$sketch_file.bootloader.bin"
             partitions_bin="$output_dir/$sketch_file.partitions.bin"
             merged_bin="$GITHUB_WORKSPACE/dist/${sketch_name}-${RELEASE_VERSION}.merged.bin"
+            arduino_merged_bin="$(find "$output_dir" -maxdepth 1 -type f -name '*.merged.bin' -print -quit)"
 
-            for image in "$app_bin" "$bootloader_bin" "$partitions_bin"; do
-              if [[ ! -f "$image" ]]; then
-                echo "::error file=$sketch_file::Expected build output was not created: $image"
-                exit 1
+            if [[ -n "$arduino_merged_bin" && -f "$arduino_merged_bin" ]]; then
+              cp "$arduino_merged_bin" "$merged_bin"
+              merge_source="arduino-cli"
+            else
+              merge_source="manual"
+
+              for image in "$app_bin" "$bootloader_bin" "$partitions_bin"; do
+                if [[ ! -f "$image" ]]; then
+                  echo "::error file=$sketch_file::Expected build output was not created: $image"
+                  exit 1
+                fi
+              done
+
+              merge_parts=(
+                0x0 "$bootloader_bin"
+                0x8000 "$partitions_bin"
+              )
+
+              if [[ -n "$boot_app0_bin" && -f "$boot_app0_bin" ]]; then
+                merge_parts+=(0xe000 "$boot_app0_bin")
               fi
-            done
 
-            merge_parts=(
-              0x0 "$bootloader_bin"
-              0x8000 "$partitions_bin"
-            )
+              merge_parts+=(0x10000 "$app_bin")
 
-            if [[ -n "$boot_app0_bin" && -f "$boot_app0_bin" ]]; then
-              merge_parts+=(0xe000 "$boot_app0_bin")
+              run_esptool \
+                --chip "$chip" \
+                merge_bin \
+                --flash_mode dio \
+                --flash_freq 80m \
+                --flash_size "$flash_size" \
+                -o "$merged_bin" \
+                "${merge_parts[@]}"
             fi
-
-            merge_parts+=(0x10000 "$app_bin")
-
-            python "$esptool_py" \
-              --chip "$chip" \
-              merge_bin \
-              --flash_mode dio \
-              --flash_freq 80m \
-              --flash_size "$flash_size" \
-              -o "$merged_bin" \
-              "${merge_parts[@]}"
 
             {
               echo "$sketch_name"
               echo "  sketch: $sketch_file"
               echo "  fqbn: $fqbn"
               echo "  chip: $chip"
+              echo "  merge_source: $merge_source"
               echo "  merged_bin: $(basename "$merged_bin")"
               echo
             } >> "$GITHUB_WORKSPACE/dist/release-manifest.txt"
