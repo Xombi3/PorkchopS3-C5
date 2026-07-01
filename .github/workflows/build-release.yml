@@ -1,0 +1,229 @@
+name: Build firmware release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example v1.0.0
+        required: true
+        type: string
+      tag:
+        description: Git tag to create or update, for example v1.0.0
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a prerelease
+        required: true
+        default: false
+        type: boolean
+
+run-name: Build ${{ inputs.version }} firmware for ${{ inputs.tag }}
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build and release merged firmware
+    runs-on: ubuntu-latest
+
+    env:
+      ARDUINO_ESP32_INDEX_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+      ESP32_CORE_VERSION: 3.3.0
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      PRERELEASE: ${{ inputs.prerelease }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core and libraries
+        run: |
+          set -euo pipefail
+
+          arduino-cli config init --overwrite
+          arduino-cli core update-index --additional-urls "$ARDUINO_ESP32_INDEX_URL"
+          arduino-cli core install "esp32:esp32@$ESP32_CORE_VERSION" --additional-urls "$ARDUINO_ESP32_INDEX_URL"
+          arduino-cli lib update-index
+          arduino-cli lib install "TFT_eSPI" "TinyGPSPlus" "Adafruit NeoPixel"
+
+      - name: Patch TFT_eSPI for ESP32-C5
+        run: |
+          set -euo pipefail
+
+          tft_lib="$HOME/Arduino/libraries/TFT_eSPI"
+          test -d "$tft_lib"
+
+          cp User_Setup.h TFT_eSPI.h TFT_eSPI.cpp "$tft_lib/"
+          mkdir -p "$tft_lib/Processors"
+          cp TFT_eSPI_ESP32_C5.h TFT_eSPI_ESP32_C5.c "$tft_lib/Processors/"
+
+      - name: Build sketches and merged binaries
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Release version may only contain letters, numbers, dots, underscores, and dashes."
+            exit 1
+          fi
+
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Release tag may only contain letters, numbers, dots, underscores, dashes, and slashes."
+            exit 1
+          fi
+
+          rm -rf build dist
+          mkdir -p build/sketches build/output dist
+
+          esptool_cmd="$(
+            find "$HOME/.arduino15/packages/esp32/tools/esptool_py" \
+              -type f \( -name esptool -o -name esptool.py \) \
+              -print 2>/dev/null | sort -V | tail -n 1 || true
+          )"
+
+          run_esptool() {
+            if [[ -z "$esptool_cmd" ]]; then
+              echo "::error::Could not find esptool in the installed ESP32 Arduino core."
+              return 1
+            fi
+
+            if [[ "$esptool_cmd" == *.py ]]; then
+              python "$esptool_cmd" "$@"
+            else
+              "$esptool_cmd" "$@"
+            fi
+          }
+
+          boot_app0_bin="$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -name boot_app0.bin -print -quit)"
+
+          find . -maxdepth 1 -type f -name '*.ino' -print0 | sort -z | while IFS= read -r -d '' sketch; do
+            sketch_file="$(basename "$sketch")"
+            sketch_name="${sketch_file%.ino}"
+            sketch_dir="$GITHUB_WORKSPACE/build/sketches/$sketch_name"
+            output_dir="$GITHUB_WORKSPACE/build/output/$sketch_name"
+
+            mkdir -p "$sketch_dir" "$output_dir"
+            cp "$sketch" "$sketch_dir/$sketch_file"
+
+            if [[ "$sketch_name" == *C5* ]]; then
+              fqbn="esp32:esp32:esp32c5:PartitionScheme=huge_app,FlashSize=16M"
+              chip="esp32c5"
+              flash_size="16MB"
+            elif [[ "$sketch_name" == *S3* ]]; then
+              fqbn="esp32:esp32:esp32s3:FlashMode=dio,FlashSize=4M,PartitionScheme=huge_app,PSRAM=disabled"
+              chip="esp32s3"
+              flash_size="4MB"
+            else
+              echo "::error file=$sketch_file::No board mapping found. Include C5 or S3 in the sketch filename or add a mapping in this workflow."
+              exit 1
+            fi
+
+            echo "Building $sketch_file for $fqbn"
+            arduino-cli compile \
+              --fqbn "$fqbn" \
+              --output-dir "$output_dir" \
+              --export-binaries \
+              "$sketch_dir"
+
+            app_bin="$output_dir/$sketch_file.bin"
+            bootloader_bin="$output_dir/$sketch_file.bootloader.bin"
+            partitions_bin="$output_dir/$sketch_file.partitions.bin"
+            merged_bin="$GITHUB_WORKSPACE/dist/${sketch_name}-${RELEASE_VERSION}.merged.bin"
+            arduino_merged_bin="$(find "$output_dir" -maxdepth 1 -type f -name '*.merged.bin' -print -quit)"
+
+            if [[ -n "$arduino_merged_bin" && -f "$arduino_merged_bin" ]]; then
+              cp "$arduino_merged_bin" "$merged_bin"
+              merge_source="arduino-cli"
+            else
+              merge_source="manual"
+
+              for image in "$app_bin" "$bootloader_bin" "$partitions_bin"; do
+                if [[ ! -f "$image" ]]; then
+                  echo "::error file=$sketch_file::Expected build output was not created: $image"
+                  exit 1
+                fi
+              done
+
+              merge_parts=(
+                0x0 "$bootloader_bin"
+                0x8000 "$partitions_bin"
+              )
+
+              if [[ -n "$boot_app0_bin" && -f "$boot_app0_bin" ]]; then
+                merge_parts+=(0xe000 "$boot_app0_bin")
+              fi
+
+              merge_parts+=(0x10000 "$app_bin")
+
+              run_esptool \
+                --chip "$chip" \
+                merge_bin \
+                --flash_mode dio \
+                --flash_freq 80m \
+                --flash_size "$flash_size" \
+                -o "$merged_bin" \
+                "${merge_parts[@]}"
+            fi
+
+            {
+              echo "$sketch_name"
+              echo "  sketch: $sketch_file"
+              echo "  fqbn: $fqbn"
+              echo "  chip: $chip"
+              echo "  merge_source: $merge_source"
+              echo "  merged_bin: $(basename "$merged_bin")"
+              echo
+            } >> "$GITHUB_WORKSPACE/dist/release-manifest.txt"
+          done
+
+          if ! compgen -G "dist/*.merged.bin" > /dev/null; then
+            echo "::error::No .ino sketches were found to build."
+            exit 1
+          fi
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# PorkChop firmware $RELEASE_VERSION"
+            echo
+            echo "Built from commit $GITHUB_SHA."
+            echo
+            echo "Merged firmware binaries:"
+            for file in dist/*.merged.bin; do
+              echo "- $(basename "$file")"
+            done
+            echo
+            echo "Build manifest:"
+            echo
+            cat dist/release-manifest.txt
+          } > dist/release-notes.md
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_args=("--prerelease=$PRERELEASE")
+
+          release_assets=(dist/*.merged.bin dist/release-manifest.txt)
+
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "PorkChop firmware $RELEASE_VERSION" \
+              --notes-file dist/release-notes.md \
+              "${release_args[@]}"
+          else
+            gh release create "$RELEASE_TAG" "${release_assets[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "PorkChop firmware $RELEASE_VERSION" \
+              --notes-file dist/release-notes.md \
+              "${release_args[@]}"
+          fi
