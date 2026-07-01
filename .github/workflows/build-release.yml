@@ -114,7 +114,7 @@ jobs:
               chip="esp32c5"
               flash_size="16MB"
             elif [[ "$sketch_name" == *S3* ]]; then
-              fqbn="esp32:esp32:esp32s3:FlashMode=dio,FlashFreq=80,FlashSize=4M,PartitionScheme=huge_app,PSRAM=disabled"
+              fqbn="esp32:esp32:esp32s3:FlashMode=dio,FlashSize=4M,PartitionScheme=huge_app,PSRAM=disabled"
               chip="esp32s3"
               flash_size="4MB"
             else
