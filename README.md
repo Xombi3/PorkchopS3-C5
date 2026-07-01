@@ -95,6 +95,18 @@ esptool.exe --port COMxx erase_flash
 ```
 (Adjust the esptool path to match your Arduino15 packages install location
 and your actual COM port.)
+Documents\Arduino\
+ How files should be organized to get it working properly
+  PorkChop_CYD_C5\
+    PorkChop_CYD_C5.ino
+
+  libraries\TFT_eSPI\
+    User_Setup.h          ← User_Setup_C5.h renamed
+    User_Setup_Select.h
+    TFT_eSPI.h
+    TFT_eSPI.cpp
+    Processors\
+    TFT_eSPI_ESP32_C5.c
 
 S3 known working stuff summarized 
 
